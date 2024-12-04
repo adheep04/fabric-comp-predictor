@@ -1,36 +1,37 @@
-                +-------------------------------------+
-                |           Input: Image             |
-                +-------------------------------------+
-                                ↓
-                +-------------------------------------+
-                |     Shared Feature Extractor       |
-                |        (e.g., ResNet)              |
-                +-------------------------------------+
-                                ↓
-                    Image Features (2048-D)
-                                ↓
-            +------------------------------------------------+
-            |       Feature Modulation with Clothing Type    |
-            +------------------------------------------------+
-            |        Input: Clothing Type (One-Hot Encoded)   |
-            +------------------------------------------------+
-                        ↓ Clothing Embedding
-                    Clothing Features (2048-D)
-                                    ↓
-            +-----------------------------------------------+
-            |    Compute Modulated Features (FiLM-style)    |
-            |                                               |
-            |   Modulated Features = γ(Image) * Features    |
-            |                         + β(Clothing)         |
-            +-----------------------------------------------+
-                                     ↓
-                      Modulated Features (2048-D)
-                                     ↓
-                   +-------------------------------+
-                   |    Fabric Composition Head     |
-                   |   (Fully Connected Layers +    |
-                   |         Softmax)               |
-                   +-------------------------------+
-                                     ↓
-                   Predicted Fabric Composition Vector
-                       (Normalized to sum to 1)
+        +-------------------------------------+         +-------------------------------------------+
+        |           Input: Image             |          |  Input: Clothing Type (One-Hot Encoded)   |
+        +-------------------------------------+         +-------------------------------------------+
+                          ↓                                                  ↓
+         +-------------------------------------+    +------------------------------------------------+
+         |     Shared Feature Extractor        |    |       Feature Modulation with Clothing Type    |
+         |        (e.g., ResNet)               |    +------------------------------------------------+
+         +-------------------------------------+                             ↓
+                          ↓                                          Clothing Embedding 
+             Image Features (4 x 2048-D)                         Clothing Features (2048-D)            
+                          ↓                                                 ↓
+         +----------------------------------+                             ↓   
+         |    Self-Attention Module         |                           ↓
+         |   (Merge 4 Features into 1)      |                         ↓
+         +----------------------------------+                       ↓
+                          ↓                                       ↓
+           Merged Image Features (2048-D)                       ↓
+                          ↓                                   ↓
+                             ↓                              ↓
+                                ↓                         ↓
+                      +-----------------------------------------------+
+                      |    Compute Modulated Features (FiLM-style)    |
+                      |                                               |
+                      |   Modulated Features = γ(Image) * Features    |
+                      |                         + β(Clothing)         |
+                      +-----------------------------------------------+
+                                              ↓
+                                   Modulated Features (2048-D)
+                                              ↓
+                               +-------------------------------+
+                               |    Fabric Composition Head    |
+                               |   (Fully Connected Layers +   |
+                               |         Softmax)              |
+                               +-------------------------------+
+                                              ↓
+                               Predicted Fabric Composition Vector
+                                    (Normalized to sum to 1)
