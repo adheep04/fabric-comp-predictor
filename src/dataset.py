@@ -10,9 +10,10 @@ import random
 import re
 
 class FabricDataset(Dataset):
-    def __init__(self, data_path, config=get_config(), transform=None):
+    def __init__(self, data_path, config=get_config(), training=True):
         self.data_path = data_path
-        self.inf_transform = transform if transform is not None else T.Compose([
+        self.training = training
+        self.inf_transform = T.Compose([
             T.Resize((224, 224)),  # Resize to ResNet's expected size
             T.ToTensor(),          # Convert to tensor
             T.Normalize(mean=[0.485, 0.456, 0.406], 
@@ -32,17 +33,20 @@ class FabricDataset(Dataset):
 
             # Adjust brightness, contrast, saturation, and hue
             T.ColorJitter(
-                brightness=0.2,  # Randomly change brightness
-                contrast=0.2,    # Randomly change contrast
-                saturation=0.2,  # Randomly change saturation
-                hue=0.1          # Randomly change hue
+                brightness=0.15,  # Randomly change brightness
+                contrast=0.15,    # Randomly change contrast
+                saturation=0.15,  # Randomly change saturation
+                hue=0.15         # Randomly change hue
             ),
 
             # Randomly rotate the image by up to 15 degrees
-            T.RandomRotation(degrees=15),
+            T.RandomRotation(degrees=13),
 
-            # Add Gaussian blur with a random kernel size
-            T.GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 2.0)),
+            # Apply GaussianBlur with reduced intensity and probability
+            T.RandomApply(
+                [T.GaussianBlur(kernel_size=(3, 3), sigma=(0.15, 1.15))],
+                p=0.38  # 30% chance of applying GaussianBlur
+            ),
 
             # Convert the image to a tensor
             T.ToTensor(),
@@ -57,7 +61,6 @@ class FabricDataset(Dataset):
         # initialize data
         self.base_fabric_types = []
         self.clothing_types = []
-        self.blended_types = []
         self.data_info = {}
         
         # gives the number of samples that have a given fabric
@@ -80,7 +83,6 @@ class FabricDataset(Dataset):
         #       clothing_type: 'clothing_type'
         #       base_comp: {'fabric_1' : num, 'fabric_2' : num, ...}
         #       folder_label: 'type'
-        #       blended_label: 'type'
         #       paths: [Path(path1), Path(path2), ...]
         #       unsure: [type]
         #           }   
@@ -89,7 +91,6 @@ class FabricDataset(Dataset):
         #       clothing_type: 'clothing_type'
         #       base_comp: {'fabric_1' : num, 'fabric_2' : num, ...}
         #       folder_label: 'type'
-        #       blended_label: 'type'
         #       paths: [Path(path1), Path(path2), ...]
         #       unsure: [type]
         #           }   
@@ -101,17 +102,22 @@ class FabricDataset(Dataset):
         return len(self.data_info)
     
     def __getitem__(self, index):
-        sample_info = self.data_info[index]
+        actual_key = list(self.data_info.keys())[index]  # Map index to data_info key
+        sample_info = self.data_info[actual_key]
+
         sample_clothing = sample_info['clothing_type']
         sample_base_comp = sample_info['base_comp']
         sample_img_paths = sample_info['paths']
         
-        clothing_type_vector = torch.tensor([1 if clothing == sample_clothing else 0 for clothing in self.clothing_types])
+        # only take the first 4 not 5
+        sample_img_paths = sample_img_paths[:4]
+        
+        clothing_type_vector = torch.tensor([1 if clothing == sample_clothing else 0 for clothing in self.clothing_types], dtype=torch.float32)
         fabric_comp_vector = torch.tensor(self.comp_to_vector(sample_base_comp))
         
         # load images
         # image_tensors = (4, 3, 224, 224) = (num_images_per_sample, RGB_channels, height, width)
-        image_tensors = [self.train_transforms(Image.open(img_path)) for img_path in sample_img_paths]
+        image_tensors = torch.stack([self.train_transforms(Image.open(img_path)) if self.training else self.inf_transform(Image.open(img_path)) for img_path in sample_img_paths])
         return (image_tensors, clothing_type_vector, fabric_comp_vector)    
     
     # initializes all 4 data fields
@@ -130,6 +136,10 @@ class FabricDataset(Dataset):
         def add_if_new(item, list):
             if isinstance(item, str) and item not in list:  # Ensure only valid strings
                 list.append(item)
+                
+        if os.path.basename(type_path).lower() in ['unclassified', 'utilities']:
+            print(f"Skipping Unclassified or Utilities folder: {type_path}")
+            return
         
         # iterates through every sample folder in subfolder
         for sample_folder in os.listdir(type_path):
@@ -143,7 +153,7 @@ class FabricDataset(Dataset):
                 continue  # Skip the current sample
             
             
-            clothing_type, comp, unsure, blended = self.parse_tag(sample_folder_path)
+            clothing_type, comp = self.parse_tag(sample_folder_path)
     
             # update self.fabric_comp and self.fabric_count
             for fabric in comp:
@@ -159,10 +169,9 @@ class FabricDataset(Dataset):
                     self.fabrics_count[fabric] = 1
                 
             
-            # update self.clothing_types and self.blended_types
+            # update self.clothing_types
             # print(f'type being added to clothing_types {type}')
             add_if_new(clothing_type, self.clothing_types)
-            add_if_new(blended, self.blended_types)
 
             # update self.clothing_type
             if clothing_type in self.clothings_count:
@@ -176,11 +185,9 @@ class FabricDataset(Dataset):
                 'base_comp': comp,
                 'paths': paths,
                 'folder_label': fabric_type,
-                'blended_label': blended,
-                'unsure': unsure,
         }
 
-    # Returns [clothing_type, composition{}, blended_type, has_question]
+    # Returns [clothing_type, composition{}]
     def parse_tag(self, sample_folder_path):
         def is_unsure(amount):
             return amount.endswith('?')
@@ -211,7 +218,6 @@ class FabricDataset(Dataset):
             return fabric_groups.get(fabric_name, fabric_name)
 
         comp = {}
-        unsure_fabrics = []
         tag_path = os.path.join(sample_folder_path, 'tag.txt')
 
         try:
@@ -229,7 +235,7 @@ class FabricDataset(Dataset):
                     fabric_name = normalize_fabric_name(comp_parts)
                     if fabric_name:
                         comp[fabric_name] = 100
-                        return [clothing_type, comp, None, None]
+                        return [clothing_type, comp]
                     raise Exception(f'Malformed composition line in {tag_path}: Empty or invalid line')
 
                 # Updated regex matching logic
@@ -246,7 +252,7 @@ class FabricDataset(Dataset):
 
                 validate_comp(comp, tag_path)
             
-                return (clothing_type, comp, None, unsure_fabrics or None)
+                return (clothing_type, comp)
         except Exception as e:
             raise Exception(f"Error parsing tag at {tag_path}: {str(e)}")
        
@@ -270,6 +276,7 @@ class FabricDataset(Dataset):
         if not (has_img and has_tag):
             raise Exception(f"sample {sample_num} in {fabric_folder_name} is missing tag or images")
         
+        # print(f'{None if sample_num else }')
         return [sample_num, imgs_paths, fabric_folder_name.lower()]
        
     def comp_to_vector(self, comp):
@@ -278,22 +285,24 @@ class FabricDataset(Dataset):
         #     i = self.clothing_types.index(f)
         #     v[i] = comp[f]
         # v = v/100
-        return [comp.get(f, 0) / 100 for f in self.clothing_types]
+        return [comp.get(f, 0) / 100 for f in self.base_fabric_types]
      
-
 def get_dataloaders(config):
-    full_dataset = FabricDataset(data_path=config['data_path'], config=config)
+    # initialize a seperate dataset for train/val
+    train_dataset = FabricDataset(data_path=config['data_path'], config=config, training=True)
+    val_dataset = FabricDataset(data_path=config['data_path'], config=config, training=False)
     
-    # use 90% of data for training, 10% for testing
-    train_size = int(len(full_dataset) * 0.9)
-    test_size = len(full_dataset) - train_size
-    
-    # split dataset
-    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
-    
+    # find train and val size
+    train_size = int(len(train_dataset) * 0.9)
+    val_size = len(train_dataset) - train_size
+
+    #split
+    train_dataset, _ = random_split(train_dataset, [train_size, val_size])
+    _, val_dataset = random_split(val_dataset, [train_size, val_size])
+
     # initialize dataloaders
-    train_dataloader = DataLoader(dataset=train_dataset, batch_size=config['batch_size'], shuffle=True)
-    test_dataloader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=True)
-    
-    return train_dataloader, test_dataloader
+    train_dataloader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+
+    return train_dataloader, val_dataloader
 

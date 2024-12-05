@@ -12,13 +12,21 @@ class FabricCompositionPredictor(nn.Module):
         fusion_block (nn.Module): The block for fusing image and clothing embeddings.
         prediction_block (nn.Module): The block for predicting fabric composition from fused features.
     """
-    def __init__(self, feature_extraction_block, attention_block, clothing_embedding_block, fusion_block,  prediction_block):
+    def __init__(self, feature_extraction_block, attention_block, clothing_embedding_block, fusion_block, prediction_block, threshold_activation):
         super().__init__()
+        
         self.feb = feature_extraction_block  # Feature extraction block
         self.attention = attention_block # sample attention block
         self.ceb = clothing_embedding_block  # Clothing embedding block
         self.fuse = fusion_block  # Fusion block
         self.pred = prediction_block  # Prediction block
+        
+        # ignore this field
+        self.threshold_activation = threshold_activation 
+        
+        self.scale = nn.Parameter(torch.ones(1))
+        self.project_residual = nn.Linear(1024, 28)
+        
         
     def forward(self, i, c):
         """
@@ -40,13 +48,19 @@ class FabricCompositionPredictor(nn.Module):
         # Embed clothing types
         clothing_embedding_output = self.ceb(c)
         
+        # kind of a residual connection
+        rand_img = torch.randint(0, 4, (1,)).item()
+        
+        feature_extractor_output = feature_extractor_output[:, rand_img, :] 
+        
         # Fuse features
-        fusion = self.fuse(attention_output, clothing_embedding_output)
+        fusion = self.fuse(attention_output, clothing_embedding_output) + attention_output * self.scale
         
         # Predict fabric composition
         prediction = self.pred(fusion)
         
         return prediction
+        
         
 
 class FeatureExtractor(nn.Module):
@@ -56,20 +70,31 @@ class FeatureExtractor(nn.Module):
     Args:
         fine_tune (bool): Whether to fine-tune the ResNet backbone or freeze its layers.
     """
-    def __init__(self, fine_tune=False):
+    def __init__(self, feature_dim, dropout, fine_tune=False):
         super().__init__()
         self.backbone = models.resnet50(pretrained=True)  # Pretrained ResNet-50 backbone
         
         # Replace the classification head with identity to extract raw features
         self.backbone.fc = nn.Identity()
+        self.projector = nn.Sequential(
+            nn.Linear(2048, feature_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
         
         if not fine_tune:
             # Freeze all layers
             for param in self.backbone.parameters():
                 param.requires_grad = False
             
-        # Unfreeze the final few layers (layer4) for fine-tuning
+        # Unfreeze the final few layers (layer4 and layer3) for fine-tuning
         for param in self.backbone.layer4.parameters():
+            param.requires_grad = True
+    
+        for param in self.backbone.layer3.parameters():
+            param.requires_grad = True
+        
+        for param in self.backbone.layer2.parameters():
             param.requires_grad = True
     
     def forward(self, x):
@@ -87,60 +112,61 @@ class FeatureExtractor(nn.Module):
         batch_size, num_images, c, h, w = x.shape
         x = x.view(batch_size * num_images, 3, 224, 224)  # Flatten to a single batch
         features = self.backbone(x)  # ResNet processes each image
-        return features.view(batch_size, num_images, -1)  # Reshape back
+        projected_features = self.projector(features)
+        projected_features = projected_features.view(batch_size, num_images, -1)  # Reshape back
+        return projected_features
+    
 
-
-class MultiHeadAttentionPerSample(nn.Module):
-    def __init__(self, feature_dim, num_heads):
+class SingleHeadAttention(nn.Module):
+    def __init__(self, feature_dim, dropout=0.1):
         super().__init__()
-        assert feature_dim % num_heads == 0, "Feature dimension must be divisible by the number of heads."
-
-        self.num_heads = num_heads
-        self.head_dim = feature_dim // num_heads  # Dimensionality per head
-        
         self.query = nn.Linear(feature_dim, feature_dim)
         self.key = nn.Linear(feature_dim, feature_dim)
         self.value = nn.Linear(feature_dim, feature_dim)
-        
-        # Final output projection layer
+
         self.out = nn.Linear(feature_dim, feature_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.softmax = nn.Softmax(dim=-1)  # Attention along the feature dimension
+        self.layer_norm = nn.LayerNorm(feature_dim)
         
-        self.softmax = nn.Softmax(dim=1)  # Attention over images
+         # Learned pooling weights for num_images
+        self.pool_weights = nn.Parameter(torch.ones(4))
+        self.pool_softmax = nn.Softmax(dim=-1)  # To normalize pooling weights
 
     def forward(self, image_features):
         """
         Args:
-            image_features (torch.Tensor): Image features of shape (batch_size, num_images, feature_dim).
-
+            image_features (torch.Tensor): Shape (batch_size, num_images, feature_dim)
         Returns:
             torch.Tensor: Fused feature tensor of shape (batch_size, feature_dim).
         """
         batch_size, num_images, feature_dim = image_features.shape
 
-        # Linear projections for query, key, and value
-        queries = self.query(image_features)  # Shape: (batch_size, num_images, feature_dim)
-        keys = self.key(image_features)      # Shape: (batch_size, num_images, feature_dim)
-        values = self.value(image_features)  # Shape: (batch_size, num_images, feature_dim)
+        # Compute queries, keys, and values
+        queries = self.query(image_features)  # (batch_size, num_images, feature_dim)
+        keys = self.key(image_features)      # (batch_size, num_images, feature_dim)
+        values = self.value(image_features)  # (batch_size, num_images, feature_dim)
 
-        # Reshape for multi-head attention
-        queries = queries.view(batch_size, num_images, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(batch_size, num_images, self.num_heads, self.head_dim).transpose(1, 2)
-        values = values.view(batch_size, num_images, self.num_heads, self.head_dim).transpose(1, 2)
+        # Compute attention scores and weights
+        attention_scores = torch.matmul(queries, keys.transpose(-1, -2))  # (batch_size, num_images, num_images)
+        attention_scores = attention_scores / (feature_dim ** 0.5)  # Scale by sqrt(feature_dim)
+        attention_weights = self.softmax(attention_scores)  # (batch_size, num_images, num_images)
 
-        # Compute attention scores and apply softmax
-        attention_scores = torch.matmul(queries, keys.transpose(-1, -2))  # Shape: (batch_size, num_heads, num_images, num_images)
-        attention_scores = attention_scores / (self.head_dim ** 0.5)  # Scale by sqrt of head_dim
-        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, num_heads, num_images, num_images)
+        # Aggregate the values
+        attended_values = torch.matmul(attention_weights, values)  # (batch_size, num_images, feature_dim)
 
-        # Apply attention weights to values
-        attended_values = torch.matmul(attention_weights, values)  # Shape: (batch_size, num_heads, num_images, head_dim)
+        # Learned pooling over num_images
+        normalized_weights = self.pool_softmax(self.pool_weights)  # (num_images,)
+        fused_features = torch.einsum('bni,n->bi', attended_values, normalized_weights)  # (batch_size, feature_dim)
 
-        # Combine heads (concat)
-        attended_values = attended_values.transpose(1, 2).contiguous().view(batch_size, num_images, feature_dim)
+        # Residual connection and normalization
+        residual = image_features.mean(dim=1)  # (batch_size, feature_dim)
+        fused_features = self.dropout(self.layer_norm(fused_features + residual))  # (batch_size, feature_dim)
 
-        # Aggregate across images and project back to feature_dim
-        fused_features = self.out(attended_values.mean(dim=1))  # Shape: (batch_size, feature_dim)
         return fused_features
+
+
 
 
 class ClothingEmbedding(nn.Module):
@@ -155,10 +181,15 @@ class ClothingEmbedding(nn.Module):
         super().__init__()
         
         self.pipeline = nn.Sequential(
-            nn.Linear(num_clothes, feature_dim),  # Linear mapping
-            nn.ReLU()  # Non-linearity
+            nn.Linear(num_clothes, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, feature_dim),
+            nn.Dropout(0.4),
         )
-    
+            
     def forward(self, x):
         """
         Forward pass through the clothing embedding block.
@@ -201,7 +232,8 @@ class FusionLayer(nn.Module):
         # Compute FiLM modulation
         modulation = self.scale(clothing_embedding_output) * feature_extractor_output + self.shift(clothing_embedding_output)
         # Apply normalization and dropout
-        return self.norm(self.dropout(modulation))
+        residual = clothing_embedding_output  # Residual connection
+        return self.norm(self.dropout(modulation + residual))  # Add residual
 
 
 class FeedForwardPrediction(nn.Module):
@@ -223,7 +255,7 @@ class FeedForwardPrediction(nn.Module):
             nn.Linear(higher_dim, feature_dim),  # Second hidden layer
             nn.ReLU(),  # Non-linearity
             nn.Linear(feature_dim, num_fabrics),  # Output layer
-            nn.Softmax(dim=1)  # Probability distribution
+            nn.Sigmoid()
         )
     
     def forward(self, x):
@@ -238,24 +270,39 @@ class FeedForwardPrediction(nn.Module):
         """
         return self.pipeline(x)
 
-def build_model(feature_dim, higher_dim, num_clothes, num_fabrics, num_heads, dropout):
-    feature_extraction_block = FeatureExtractor()
-    attention_block = MultiHeadAttentionPerSample(feature_dim=feature_dim, num_heads=num_heads)
-    clothing_embedding_block = ClothingEmbedding(num_clothes=num_clothes)
+class ThresholdActivation(nn.Module):
+    def __init__(self, threshold=0.1):
+        super(ThresholdActivation, self).__init__()
+        self.threshold = threshold
+
+    def forward(self, x):
+        # Apply threshold: Set values below the threshold to 0
+        return torch.where(x >= self.threshold, x, torch.tensor(0.0, device=x.device))
+    
+    
+def build_model(feature_dim, higher_dim, num_clothes, num_fabrics, dropout, threshold):
+    
+    # initialize all necessary blocks with their respective arguments
+    feature_extraction_block = FeatureExtractor(feature_dim=feature_dim, dropout=dropout)
+    attention_block = SingleHeadAttention(feature_dim=feature_dim, dropout=dropout)
+    clothing_embedding_block = ClothingEmbedding(num_clothes=num_clothes, feature_dim=feature_dim)
     fusion_block = FusionLayer(feature_dim=feature_dim, dropout=dropout)
     prediction_feed_forward_layer = FeedForwardPrediction(feature_dim=feature_dim, higher_dim=higher_dim, num_fabrics=num_fabrics, dropout=dropout)
+    threshold_actication_layer = ThresholdActivation(threshold)
+    
     
     return FabricCompositionPredictor(feature_extraction_block, 
                                       attention_block, 
                                       clothing_embedding_block, 
                                       fusion_block, 
-                                      prediction_feed_forward_layer)
+                                      prediction_feed_forward_layer,
+                                      threshold_actication_layer)
 
 def get_model(config):
     return build_model(feature_dim=config['feature_dim'],
                        higher_dim=config['higher_dim'],
                        num_clothes=config['num_clothes'],
                        num_fabrics=config['num_fabrics'],
-                       num_heads=config['num_heads'],
-                       dropout=config['dropout']
+                       dropout=config['dropout'],
+                       threshold=config['threshold']
                 )
